@@ -17,31 +17,92 @@ import magic
 import requests
 import logging
 import hashlib
+import json
 
-logging.basicConfig(level=logging.DEBUG,format='%(asctime)s %(levelname)s %(message)s',filename='/tmp/cuckoolyse.log',filemode='a')
+logging.basicConfig(level=logging.DEBUG,format='%(asctime)s %(levelname)s %(message)s',filename='/home/cuckoolyse/cuckoolyse.log',filemode='a')
 
 ### CONFIG OPTIONS ###
-# MIME Types to extract and submit from the email
+# MIME Types to ignore in the email aka extract and submit everything else.
+
 mtypes = [
-            'application/octet-stream',
-            'application/msword',
-            'application/pdf',
-            'application/x-msdownload',
-            'application/zip',
-            'application/javascript',
-            'application/x-rar-compressed'
-            'text/javascript',
-            'application/x-compressed',
+            'multipart/mixed',
+            'multipart/alternative',
+            'multipart/report',
+            'multipart/html',
+            'multipart/related',
+            'message/rfc822',
+            'message/delivery-status',
+            'text/plain',
+            'text/rfc822-headers',
+            'text/html'
          ]
 
 #REST URL for Cuckoo submission
 url = "http://YOUR_CUCKOO_ADDR:8090"
 
 # Prefix to prepend to filename in submission
-prefix = "AUTOSUBMIT-"
+prefix = "CUCKOOLYSE-"
+
+def upload_to_cuckoo(filename, attachment, mode=None):
+    """
+        Cuckoo upload helper
+    """
+    logging.info("Got file: %s", filename)
+    office = ['.doc', '.docx', '.docm', '.xls', '.xlsm', '.xlt', '.xltm', '.ppt', '.pptx']
+    for extension in office:
+        if filename.endswith(extension):
+            mode = "office"
+            logging.info("Changing to Office mode")
+
+    # Check if file has already been analysed
+    try:
+        shasum = hashlib.sha256(attachment).hexdigest()
+        logging.debug("Checking if %s has already been analysed...", shasum)
+
+        # Request file info from Cuckoo
+        response = requests.get("{0}/files/view/sha256/{1}".format(url, shasum))
+
+        # 404 Response indicates hash does not exist
+        # 200 indicates file already exists
+        if response.status_code == 200:
+            finfo = response.json()
+            logging.info("File has already been analysed, not submitting")
+            logging.debug("Response was: %s", finfo)
+        elif response.status_code == 404:
+            logging.info("Submitting to cuckoo via %s", url)
+            # Send request
+            if mode:
+                files = {"file":(prefix +filename, attachment)}
+                payload = {'options': "mode=%s" % mode}
+                logging.info("mode = %s %s", mode, files)
+            else:
+                files = {"file":(prefix +filename, attachment)}
+                payload = {}
+
+            response = requests.post("{0}/tasks/create/file".format(url), files=files, data=payload)
+            json_decoder = json.JSONDecoder()
+            task_id = json_decoder.decode(response.text)["task_id"]
+            logging.debug("ADDED TASK: %s", task_id)
+
+            if task_id is None:
+                raise Exception("No Task ID from Cuckoo. Assuming submission failure")
+
+            logging.info("SUCCESS: Submitted to Cuckoo as task ID %s", task_id)
+            return 0
+        else:
+            raise Exception("Unexpected response code whilst requesting file details")
+
+    except Exception as e:
+        logging.error("Unable to submit file to Cuckoo: %s", e)
+        return 1
+
 
 # Submit the sample to cuckoo
 def cuckoolyse(msg):
+    """
+        Parse email for attachment
+    """
+    logging.debug("Received email with subject %s from %s", msg['subject'], msg['from'].encode('utf-8').strip())
     # Check if multipart
     if not msg.is_multipart():
         #Not multipart? Then we don't care, pass it back
@@ -51,73 +112,16 @@ def cuckoolyse(msg):
     # Cycle through multipart message
     # Find attachments (application/octet-stream?)
     for part in msg.walk():
-        # TODO: Other mime types? pdf? doc?
-        logging.debug("Processing mail part of type %s" % (part.get_content_type()))
-        if part.get_content_type().strip() in mtypes:
-            # Extract attachment to a staging directory
-            # Extract attachment to memory?
+        if part.get('Content-Disposition') is None:
+            logging.debug("Email Content-Disposition is None")
+            continue
+        if not part.get_content_type().strip() in mtypes:
+            logging.debug("Processing mail part of type: %s", part.get_content_type())
             attachment = part.get_payload(decode=True)
-            mtype = magic.from_buffer(attachment, mime=True)
+            filename = part.get_filename().encode('utf-8').strip()
+            logging.info("Found attachment %s from %s", filename, msg['from'])
 
-            # Secondary check using magic numbers
-            # Sometimes we get octet-streams which we do not want to analyse
-            if mtype not in mtypes:
-                return
-
-            logging.info("Found attachment %s of type %s from %s" %(part.get_filename(), mtype, msg['from']))
-
-            # Multipart POST for Cuckoo API
-            files = {"file":(prefix +part.get_filename(), attachment)}
-
-            # May wish to set some cuckoo options?
-            data = dict(
-                package="",
-                timeout=0,
-                options="",
-                priority=1,
-                machine="",
-                platform="",
-                memory=False,
-                enforce_timeout=False,
-                custom="",
-                tags = None
-            )
-
-            try:
-		hash = hashlib.sha256()
-		hash.update(attachment)
-		shasum = hash.hexdigest()
-                logging.info("Checking if %s has already been analysed..." % (shasum))
-		
-		# Request file info from Cuckoo
-		response = requests.get("%s/files/view/sha256/%s" % (url,shasum))
-		# 404 Response indicates hash does not exist
-		# 200 indicates file already exists
-		if response.status_code() == 200:
-		    finfo = response.json()
-		    logging.info("File has already been analysed, not submitting ()")
-		elif response.status_code() == 404:
-		                
-
-                    logging.info("Submitting to cuckoo via %s" % (url))
-                    # Send request
-                    response = requests.post("%s/tasks/create/file" % (url), files=files, data=data)
-                    json = response.json()
-                    logging.debug("Received JSON response: %s" % (json))
-
-                    # Task ID from Cuckoo
-                    task_id = json["task_id"]
-
-                    if task_id is None:
-                        raise Exception("Cuckoo did not response with a Task ID. Assuming submission failure")
-                    logging.info("SUCCESS: Submitted to remote Cuckoo instance as task ID %i" % (task_id))
-                    return 0
-		else:
-		    raise Exception("Unexpected reponse code whilst requesting file details")
-
-            except Exception as e:
-                logging.error("Unable to submit file to Cuckoo: %s" %(e))
-                return 1
+            upload_to_cuckoo(filename, attachment)
 
 # Get email from STDIN
 input = sys.stdin.readlines()
