@@ -6,6 +6,8 @@
 ## Author: Thomas White <thomas@tribalchicken.com.au>
 ## https://tribalchicken.com.au
 
+## Modifcations by haam3r (https://github.com/haam3r)
+## To install sflock, simply do pip install sflock
 
 # TODO: Configurable logging location
 # TODO: Probably needs a sanity check on the file size
@@ -13,11 +15,10 @@
 
 import email
 import sys
-import magic
-import requests
 import logging
-import hashlib
 import json
+import requests
+from sflock.main import unpack
 
 logging.basicConfig(level=logging.DEBUG,format='%(asctime)s %(levelname)s %(message)s',filename='/home/cuckoolyse/cuckoolyse.log',filemode='a')
 
@@ -35,33 +36,35 @@ mtypes = [
             'text/plain',
             'text/rfc822-headers',
             'text/html'
-         ]
+]
 
 #REST URL for Cuckoo submission
-url = "http://YOUR_CUCKOO_ADDR:8090"
+url = "http://cuckoo.url.com:8090"
 
 # Prefix to prepend to filename in submission
 prefix = "CUCKOOLYSE-"
 
-def upload_to_cuckoo(filename, attachment, mode=None):
+def upload_to_cuckoo(f, mode=None):
     """
         Cuckoo upload helper
     """
-    logging.info("Got file: %s", filename)
+    logging.info("Got file: %s", f.filename)
     office = ['.doc', '.docx', '.docm', '.xls', '.xlsm', '.xlt', '.xltm', '.ppt', '.pptx']
     for extension in office:
-        if filename.endswith(extension):
+        if f.filename.endswith(extension):
             mode = "office"
             logging.info("Changing to Office mode")
 
     # Check if file has already been analysed
     try:
-        shasum = hashlib.sha256(attachment).hexdigest()
-        logging.debug("Checking if %s has already been analysed...", shasum)
-
+        logging.debug("Checking if %s has already been analysed...", f.sha256)
         # Request file info from Cuckoo
-        response = requests.get("{0}/files/view/sha256/{1}".format(url, shasum))
+        response = requests.get("{0}/files/view/sha256/{1}".format(url, f.sha256))
+    except requests.exceptions.RequestException as check_err:
+        logging.error("Unable to check if unique: %s", check_err)
+        return 1
 
+    try:
         # 404 Response indicates hash does not exist
         # 200 indicates file already exists
         if response.status_code == 200:
@@ -72,17 +75,16 @@ def upload_to_cuckoo(filename, attachment, mode=None):
             logging.info("Submitting to cuckoo via %s", url)
             # Send request
             if mode:
-                files = {"file":(prefix +filename, attachment)}
+                files = {"file": (prefix +f.filename, f.contents)}
                 payload = {'options': "mode=%s" % mode}
-                logging.info("mode = %s %s", mode, files)
+                logging.info("Setting mode = %s for file %s", mode, f.filename)
             else:
-                files = {"file":(prefix +filename, attachment)}
+                files = {"file": (prefix +f.filename, f.contents)}
                 payload = {}
 
             response = requests.post("{0}/tasks/create/file".format(url), files=files, data=payload)
             json_decoder = json.JSONDecoder()
             task_id = json_decoder.decode(response.text)["task_id"]
-            logging.debug("ADDED TASK: %s", task_id)
 
             if task_id is None:
                 raise Exception("No Task ID from Cuckoo. Assuming submission failure")
@@ -92,25 +94,25 @@ def upload_to_cuckoo(filename, attachment, mode=None):
         else:
             raise Exception("Unexpected response code whilst requesting file details")
 
-    except Exception as e:
-        logging.error("Unable to submit file to Cuckoo: %s", e)
+    except requests.exceptions.RequestException as submit_err:
+        logging.error("Unable to submit file to Cuckoo: %s", submit_err)
         return 1
 
 
 # Submit the sample to cuckoo
 def cuckoolyse(msg):
     """
-        Parse email for attachment
+        Parse email for attachment(s)
     """
-    logging.debug("Received email with subject %s from %s", msg['subject'], msg['from'].encode('utf-8').strip())
+    logging.debug("Received email with subject %s from %s", msg['subject'], msg['from'])
+
     # Check if multipart
     if not msg.is_multipart():
         #Not multipart? Then we don't care, pass it back
-        logging.debug("Returning non-multipart message to queue.")
+        logging.info("Returning non-multipart message to queue.")
         return
 
-    # Cycle through multipart message
-    # Find attachments (application/octet-stream?)
+    # Cycle through multipart message for attachments to analyse
     for part in msg.walk():
         if part.get('Content-Disposition') is None:
             logging.debug("Email Content-Disposition is None")
@@ -119,9 +121,20 @@ def cuckoolyse(msg):
             logging.debug("Processing mail part of type: %s", part.get_content_type())
             attachment = part.get_payload(decode=True)
             filename = part.get_filename().encode('utf-8').strip()
-            logging.info("Found attachment %s from %s", filename, msg['from'])
+            logging.debug("Found attachment %s from %s", filename, msg['from'])
+            # Hand it over to sflock for parsing
+            f = unpack(filename=filename, contents=attachment)
 
-            upload_to_cuckoo(filename, attachment)
+            try:
+                if f.astree().get('children'):
+                    for child in f.children:
+                        logging.debug("Extracted file: %s", child.filename)
+                        upload_to_cuckoo(child)
+                else:
+                    upload_to_cuckoo(f)
+            except Exception as e:
+                logging.error(e)
+                logging.error("Caught exception while submitting for upload %s", f)
 
 # Get email from STDIN
 input = sys.stdin.readlines()
