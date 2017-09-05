@@ -82,14 +82,19 @@ def upload_to_cuckoo(f, mode=None):
                 files = {"file": (prefix +f.filename, f.contents)}
                 payload = {}
 
-            response = requests.post("{0}/tasks/create/file".format(url), files=files, data=payload)
-            json_decoder = json.JSONDecoder()
-            task_id = json_decoder.decode(response.text)["task_id"]
+            # Submit to analysis and parse response
+            response = requests.post("{0}/tasks/create/submit".format(url), files=files, data=payload)
+            submit_id = response.json()["submit_id"]
+            task_ids = response.json()["task_ids"]
+            errors = response.json()["errors"]
 
-            if task_id is None:
-                raise Exception("No Task ID from Cuckoo. Assuming submission failure")
+            if task_ids is None:
+                if errors is not None:
+                    raise Exception("Received error %s in response to submission", errors)
+                else:
+                    raise Exception("No Task ID-s or errors from Cuckoo. Unknown submission failure")
 
-            logging.info("SUCCESS: Submitted to Cuckoo as task ID %s", task_id)
+            logging.info("SUCCESS: Submitted to Cuckoo as task ID %s", task_ids)
             return 0
         else:
             raise Exception("Unexpected response code whilst requesting file details")
